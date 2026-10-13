@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# scripts/helm: host-side shim: delegate to the toolbox container.
+#   ./scripts/helm list -A
+set -eu
+if command -v docker >/dev/null 2>&1 && docker compose ps toolbox 2>/dev/null | grep -q tool; then\n  exec docker compose exec -T toolbox helm "$@"\nelif ! command -v helm >/dev/null 2>&1; then
+  exec docker compose exec -T toolbox helm "$@"
+fi
+exec helm "$@"
+

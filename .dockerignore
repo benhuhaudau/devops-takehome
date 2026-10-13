@@ -1,0 +1,4 @@
+app/quote-api/quote-api
+*.exe
+*.env
+secrets/

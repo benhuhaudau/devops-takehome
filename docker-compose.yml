@@ -1,0 +1,51 @@
+services:
+  # One-shot: creates the k3d cluster (1 server + 4 agents) if it does not
+  # exist and applies the provided troubleshoot/prepare.sh node simulation.
+  # Uses the prebuilt toolbox image directly (multi-arch, published to GHCR):
+  # reviewers do not need to build anything. Offline contributors can still
+  # build it manually: docker build -t ghcr.io/benhuhaudau/takehome-toolbox:latest harness/toolbox
+  cluster-bootstrap:
+    image: ghcr.io/benhuhaudau/takehome-toolbox:latest
+    container_name: takehome-cluster-bootstrap
+    command: ["/bin/bash", "/scripts/00-bootstrap.sh"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # works on Linux engine too
+    volumes:
+      - ./scripts:/scripts
+      - ./:/repo:ro
+      - ./app:/src
+      - ./infra:/infra
+      - ./config:/config
+      - ./troubleshoot:/troubleshoot
+      - /var/run/docker.sock:/var/run/docker.sock
+      - kubeconfig:/kubeconfig
+    environment:
+      KUBECONFIG: /kubeconfig/config
+
+  # Long-running toolbox: kubectl/helm/terraform/k6/k3d, scripts bind-mounted.
+  # Everything in ./scripts/NN-*.sh is executed here via:
+  #   docker compose exec toolbox /scripts/run-all.sh
+  toolbox:
+    image: ghcr.io/benhuhaudau/takehome-toolbox:latest
+    container_name: takehome-toolbox
+    command: ["/bin/bash", "-c", "sleep infinity"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./scripts:/scripts
+      - ./:/repo:ro
+      - ./app:/src:ro
+      - ./infra:/infra
+      - ./config:/config
+      - ./troubleshoot:/troubleshoot
+      - /var/run/docker.sock:/var/run/docker.sock
+      - kubeconfig:/kubeconfig
+    depends_on:
+      cluster-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      KUBECONFIG: /kubeconfig/config
+
+volumes:
+  kubeconfig:
+

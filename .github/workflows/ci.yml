@@ -1,0 +1,131 @@
+# CI for the quote-api service: GitLab → GitHub Actions migration (Part 4).
+# Intent preserved, practices modernized; details in MIGRATION-NOTES.md.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write        # GHCR push via built-in token (no PAT)
+  # security-events: write   # uncomment if uploading SARIF to code scanning
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository_owner }}/quote-api
+  TOOLBOX: ghcr.io/${{ github.repository_owner }}/takehome-toolbox
+
+jobs:
+  test:
+    # gitlab legacy: `npm test || echo "tests flaky, continuing"`: replaced by
+    # a gate. Tests must be able to fail the pipeline.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: app/quote-api/go.mod
+      - name: go test
+        working-directory: app/quote-api
+        run: go test -v -count=1 ./...
+
+  sast:
+    # gitlab legacy: sonar-scanner with allow_failure: true: a scan that can
+    # never fail is decoration. Semgrep runs in-repo, no server, and --error
+    # turns findings into a hard pipeline failure.
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: semgrep scan (hard gate)
+        run: semgrep scan --config p/golang --config p/security-audit --error
+
+  build:
+    # gitlab legacy: docker:20.10 + dind + single floating :latest tag on
+    # master only. Now: buildx layer cache, build for every PR (no push),
+    # push to GHCR on master tagged with the immutable short SHA + latest.
+    runs-on: ubuntu-latest
+    needs: [test, sast]
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: short sha tag
+        if: github.ref == 'refs/heads/master'
+        run: echo "SHORT_TAG=${GITHUB_SHA:0:12}" >> $GITHUB_ENV
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-qemu-action@v3   # cross-arch emulation for arm64
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build (all events) / push (master)
+        uses: docker/build-push-action@v6
+        with:
+          context: app/quote-api
+          file: app/quote-api/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          # push to ghcr.io/<owner>/<repo>: same-owner → GITHUB_TOKEN suffices
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:${{ env.SHORT_TAG }}
+            ${{ github.ref == 'refs/heads/master' && format('{0}:latest', env.IMAGE) || format('{0}:pr-{1}', env.IMAGE, github.event.number) }}
+          push: ${{ github.ref == 'refs/heads/master' }}
+          load: ${{ github.ref != 'refs/heads/master' }}
+          cache-from: type=gha,scope=quote-api
+          cache-to: type=gha,scope=quote-api,mode=max
+
+  image-scan:
+    # Trivy gate on the built image: HIGH/CRITICAL findings fail the build
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    steps:
+      - name: trivy scan (HIGH/CRITICAL gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          format: table
+          version: v0.75.0   # pin scanner binary; action resolves via setup-trivy
+
+  toolbox:
+    # The harness toolbox (k3d/kubectl/helm/terraform/k6/docker CLI) is
+    # published as well: reviewers get a pre-pull-able image and the registry
+    # requirement is satisfied for every image the harness runs.
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: harness/toolbox
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.TOOLBOX }}:latest
+            ${{ env.TOOLBOX }}:${{ github.sha }}
+          cache-from: type=gha,scope=toolbox
+          cache-to: type=gha,scope=toolbox,mode=max
+
+
+

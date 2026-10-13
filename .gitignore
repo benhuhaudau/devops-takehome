@@ -1,0 +1,12 @@
+.kube/
+*.log
+app/quote-api/quote-api
+
+# problem statement / provided package: local only, never commit
+ASSIGNMENT*.md
+devops-takehome-package/
+devops-takehome-package.zip
+
+.terraform/
+*.lock.hcl
+

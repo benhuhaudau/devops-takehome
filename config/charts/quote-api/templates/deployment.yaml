@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Release.Name }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        # Hard eligibility filter (role-based, NOT capacity-based): the app
+        # never runs on control-plane nodes. In k3d the server node is not
+        # tainted, so without this the scheduler can treat it as a clean
+        # topology domain and drift workloads onto it.
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+          # Soft: hard spot pinning would strand pods when a spot node is
+          # reclaimed; the shape itself comes from the topology spreads below.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 40
+              preference:
+                matchExpressions:
+                  - key: acme.io/capacity
+                    operator: In
+                    values: [spot]
+            - weight: 10
+              preference:
+                matchExpressions:
+                  - key: acme.io/capacity
+                    operator: In
+                    values: [on-demand]
+      # Spread 1: prefer a ~2:1 ratio across capacity domains (2 spot nodes +
+      # 1 on-demand node). Soft: a hard capacity-domain constraint would
+      # block HPA scale-out beyond 3 replicas (skew >1 at that ratio).
+      # ScheduleAnyway = rescheduling still works when a node disappears.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: acme.io/capacity
+          whenUnsatisfiable: ScheduleAnyway
+          nodeAffinityPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Release.Name }}
+        # Spread 2: HARD node spread: 3 replicas over the 3 eligible worker
+        # nodes guarantees exactly one pod on the on-demand node initially,
+        # and pods never stack on one node. nodeTaintsPolicy: Honor excludes
+        # the tainted GPU node from the domain count (k8s 1.23+, stable since
+        # 1.26), so it can't stall scheduling or skew the math. During the
+        # reclaim drill a cordoned spot node is not counted, and evicted pods
+        # reschedule onto remaining nodes without violating the skew.
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          nodeAffinityPolicy: Honor
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Release.Name }}
+      # no tolerations: GPU node stays tainted and unreachable for this app
+      containers:
+        - name: quote-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
